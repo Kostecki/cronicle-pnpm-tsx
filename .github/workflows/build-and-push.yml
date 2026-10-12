@@ -5,15 +5,63 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 4 * * 1" # Weekly (Mon 04:00 UTC) rebuild to pick up cronicle-edge:latest
+    - cron: "0 4 * * 1" # Weekly (Mon 04:00 UTC) — only rebuilds if the base image moved
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  BASE_IMAGE: ghcr.io/cronicle-edge/cronicle-edge:latest
+  BASE_DIGEST_LABEL: dk.kostecki.base-digest
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      base_digest: ${{ steps.decide.outputs.base_digest }}
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether a rebuild is needed
+        id: decide
+        run: |
+          set -euo pipefail
+
+          base_digest=$(docker buildx imagetools inspect "$BASE_IMAGE" --format '{{.Manifest.Digest}}')
+          echo "base_digest=$base_digest" >> "$GITHUB_OUTPUT"
+
+          # Push / manual runs always build (code or Dockerfile may have changed).
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Event '${{ github.event_name }}' -> build."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Scheduled runs only build when the base image digest has moved since
+          # our last build (stored as a label on our current :latest).
+          image="${REGISTRY}/$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]'):latest"
+          current=$(docker buildx imagetools inspect "$image" \
+            --format "{{ index .Image.Config.Labels \"$BASE_DIGEST_LABEL\" }}" 2>/dev/null || echo "")
+
+          if [ "$base_digest" = "$current" ]; then
+            echo "Base image unchanged ($base_digest) — skipping rebuild."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Base image changed: '${current:-none}' -> '$base_digest' — build."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-push-image:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,6 +90,8 @@ jobs:
         uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            ${{ env.BASE_DIGEST_LABEL }}=${{ needs.check.outputs.base_digest }}
 
       - name: Build and push Docker image
         id: push
@@ -50,6 +100,7 @@ jobs:
           context: .
           push: true
           pull: true
+          provenance: false
           tags: |
             ${{ steps.meta.outputs.tags }}
             ${{ env.REGISTRY }}/${{ env.lowercase_image_name }}:latest
